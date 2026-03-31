@@ -1,6 +1,7 @@
 import inspect
 import logging
 
+import torch
 import torch.nn
 from torch_runstats.scatter import scatter, scatter_mean
 
@@ -25,7 +26,11 @@ class SimpleLoss:
     """
 
     def __init__(self, func_name: str, params: dict = {}):
-        self.ignore_nan = params.get("ignore_nan", False)
+        params = dict(params)
+        self.ignore_nan = params.pop("ignore_nan", False)
+        self.exclude_indices = self._parse_exclude_indices(
+            params.pop("exclude_indices", [])
+        )
         func, _ = instantiate_from_cls_name(
             torch.nn,
             class_name=func_name,
@@ -37,6 +42,53 @@ class SimpleLoss:
         self.func_name = func_name
         self.func = func
 
+    @staticmethod
+    def _parse_exclude_indices(exclude_indices):
+        if exclude_indices in (None, []):
+            return tuple()
+        if isinstance(exclude_indices, (list, tuple)) and len(exclude_indices) > 0:
+            if all(isinstance(idx, int) for idx in exclude_indices):
+                return (tuple(exclude_indices),)
+            return tuple(tuple(int(i) for i in idx) for idx in exclude_indices)
+        raise TypeError("exclude_indices must be a list of indices")
+
+    def _make_component_mask(self, loss: torch.Tensor):
+        if len(self.exclude_indices) == 0:
+            return None
+        if loss.ndim <= 1:
+            raise ValueError(
+                "exclude_indices requires the target to have at least one component dimension"
+            )
+        component_shape = tuple(loss.shape[1:])
+        mask = torch.ones(component_shape, dtype=torch.bool, device=loss.device)
+        for index in self.exclude_indices:
+            if len(index) != len(component_shape):
+                raise ValueError(
+                    f"exclude index {index} does not match component shape {component_shape}"
+                )
+            mask[index] = False
+        if not torch.any(mask):
+            raise ValueError("exclude_indices removes all components")
+        return mask.reshape(-1)
+
+    def _select_components(self, tensor: torch.Tensor):
+        if len(self.exclude_indices) == 0:
+            return tensor
+        flat = tensor.reshape(tensor.shape[0], -1)
+        return flat[:, self._make_component_mask(tensor)]
+
+    def _reduce(self, loss: torch.Tensor, valid_mask: torch.Tensor, mean: bool):
+        selected_loss = self._select_components(loss)
+        selected_valid = self._select_components(valid_mask.to(loss.dtype))
+        if mean:
+            denom = selected_valid.sum()
+            if torch.eq(denom, 0).item():
+                return selected_loss.sum() * 0.0
+            return (selected_loss * selected_valid).sum() / denom
+        if len(self.exclude_indices) == 0:
+            return loss * valid_mask.to(loss.dtype)
+        return selected_loss * selected_valid
+
     def __call__(
         self,
         pred: dict,
@@ -44,21 +96,15 @@ class SimpleLoss:
         key: str,
         mean: bool = True,
     ):
-        # zero the nan entries
-        has_nan = self.ignore_nan and torch.isnan(ref[key].mean())
+        valid_mask = torch.ones_like(ref[key], dtype=torch.bool)
+        has_nan = self.ignore_nan and torch.isnan(ref[key]).any()
         if has_nan:
-            not_nan = (ref[key] == ref[key]).int()
-            loss = self.func(pred[key], torch.nan_to_num(ref[key], nan=0.0)) * not_nan
-            if mean:
-                return loss.sum() / not_nan.sum()
-            else:
-                return loss
+            valid_mask = ref[key] == ref[key]
+            target = torch.nan_to_num(ref[key], nan=0.0)
         else:
-            loss = self.func(pred[key], ref[key])
-            if mean:
-                return loss.mean()
-            else:
-                return loss
+            target = ref[key]
+        loss = self.func(pred[key], target)
+        return self._reduce(loss=loss, valid_mask=valid_mask, mean=mean)
 
 
 class PerAtomLoss(SimpleLoss):
@@ -69,38 +115,30 @@ class PerAtomLoss(SimpleLoss):
         key: str,
         mean: bool = True,
     ):
-        # zero the nan entries
-        has_nan = self.ignore_nan and torch.isnan(ref[key].sum())
+        has_nan = self.ignore_nan and torch.isnan(ref[key]).any()
         N = torch.bincount(ref[AtomicDataDict.BATCH_KEY])
-        # N = N.reshape((-1, 1))
+        target = ref[key]
+        valid_mask = torch.ones_like(target, dtype=torch.bool)
+        len_size = len(target.shape)
+        expanded_N = N
+        for _ in range(len_size - 1):
+            expanded_N = expanded_N.unsqueeze(-1)
         if has_nan:
-            not_nan = (ref[key] == ref[key]).int()
+            valid_mask = ref[key] == ref[key]
             loss = (
-                self.func(pred[key], torch.nan_to_num(ref[key], nan=0.0)) * not_nan / N
+                self.func(pred[key], torch.nan_to_num(ref[key], nan=0.0))
+                / expanded_N
             )
             if self.func_name == "MSELoss":
-                len_size = len(loss.shape)
-                for i in range(len_size - 1):
-                    N = N.unsqueeze(-1)
-                loss = loss / N
+                loss = loss / expanded_N
             assert loss.shape == pred[key].shape  # [atom, dim]
-            if mean:
-                return loss.sum() / not_nan.sum()
-            else:
-                return loss
         else:
             loss = self.func(pred[key], ref[key])
-            len_size = len(loss.shape)
-            for i in range(len_size - 1):
-                N = N.unsqueeze(-1)
-            loss = loss / N
+            loss = loss / expanded_N
             if self.func_name == "MSELoss":
-                loss = loss / N
+                loss = loss / expanded_N
             assert loss.shape == pred[key].shape  # [atom, dim]
-            if mean:
-                return loss.mean()
-            else:
-                return loss
+        return self._reduce(loss=loss, valid_mask=valid_mask, mean=mean)
 
 
 class PerSpeciesLoss(SimpleLoss):
@@ -120,30 +158,32 @@ class PerSpeciesLoss(SimpleLoss):
         if not mean:
             raise NotImplementedError("Cannot handle this yet")
 
-        has_nan = self.ignore_nan and torch.isnan(ref[key].mean())
+        has_nan = self.ignore_nan and torch.isnan(ref[key]).any()
 
         if has_nan:
-            not_nan = (ref[key] == ref[key]).int()
-            per_atom_loss = (
-                self.func(pred[key], torch.nan_to_num(ref[key], nan=0.0)) * not_nan
-            )
+            valid_mask = ref[key] == ref[key]
+            per_atom_loss = self.func(pred[key], torch.nan_to_num(ref[key], nan=0.0))
         else:
+            valid_mask = torch.ones_like(ref[key], dtype=torch.bool)
             per_atom_loss = self.func(pred[key], ref[key])
 
-        reduce_dims = tuple(i + 1 for i in range(len(per_atom_loss.shape) - 1))
+        flat_loss = per_atom_loss.reshape(per_atom_loss.shape[0], -1)
+        flat_valid = valid_mask.reshape(valid_mask.shape[0], -1).to(per_atom_loss.dtype)
+        if len(self.exclude_indices) > 0:
+            component_mask = self._make_component_mask(per_atom_loss)
+            flat_loss = flat_loss[:, component_mask]
+            flat_valid = flat_valid[:, component_mask]
+
+        denom = flat_valid.sum(dim=1)
+        safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+        per_atom_loss = (flat_loss * flat_valid).sum(dim=1) / safe_denom
 
         spe_idx = pred[AtomicDataDict.ATOM_TYPE_KEY].squeeze(-1)
         if has_nan:
-            if len(reduce_dims) > 0:
-                per_atom_loss = per_atom_loss.sum(dim=reduce_dims)
-            assert per_atom_loss.ndim == 1
-
             per_species_loss = scatter(per_atom_loss, spe_idx, dim=0)
-
             assert per_species_loss.ndim == 1  # [type]
 
-            N = scatter(not_nan, spe_idx, dim=0)
-            N = N.sum(reduce_dims)
+            N = scatter((denom > 0).to(per_atom_loss.dtype), spe_idx, dim=0)
             N = N.reciprocal()
             N_species = ((N == N).int()).sum()
             assert N.ndim == 1  # [type]
@@ -153,9 +193,6 @@ class PerSpeciesLoss(SimpleLoss):
             return per_species_loss
 
         else:
-
-            if len(reduce_dims) > 0:
-                per_atom_loss = per_atom_loss.mean(dim=reduce_dims)
             assert per_atom_loss.ndim == 1
 
             # offset species index by 1 to use 0 for nan

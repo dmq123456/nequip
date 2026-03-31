@@ -359,6 +359,7 @@ def main(args=None, running_as_script: bool = True):
             all_args=metrics_config,
         )
         metrics.to(device=device)
+        exclude_indices_map = build_exclude_indices_map(metrics_components)
 
         component_metrics = None
         component_predict_value = None
@@ -374,6 +375,7 @@ def main(args=None, running_as_script: bool = True):
         out_key = metrics.funcs.keys()
         predict_value = {}
         dft_value = {}
+        output_shapes = {}
         for key in out_key:
             predict_value[key] = torch.tensor([])
             dft_value[key] = torch.tensor([])
@@ -469,6 +471,8 @@ def main(args=None, running_as_script: bool = True):
                         if args.component:
                             component_predict_value[key].append(out[key].detach().cpu())
                             component_dft_value[key].append(batch[key].detach().cpu())
+                        if key not in output_shapes:
+                            output_shapes[key] = tuple(out[key].shape[1:])
 
             batch_i += 1
             prog.update(batch.num_graphs)
@@ -493,6 +497,8 @@ def main(args=None, running_as_script: bool = True):
             component_results = flatten_component_metrics(
                 metrics=component_metrics,
                 type_names=dataset.type_mapper.type_names,
+                key_shapes=output_shapes,
+                exclude_indices_map=exclude_indices_map,
             )
             if len(component_results) > 0:
                 logger.info("\n--- Component-wise result: ---")
@@ -504,8 +510,14 @@ def main(args=None, running_as_script: bool = True):
                 )
 
         for key in out_key:
-            plot_parity(predict_value[key], dft_value[key], key, dict="png")
-            plot_error(predict_value[key], dft_value[key], key, dict="png_error")
+            pred_plot, true_plot = select_plot_series(
+                pred=predict_value[key],
+                true=dft_value[key],
+                shape=output_shapes.get(key, tuple()),
+                exclude_indices=exclude_indices_map.get(key, tuple()),
+            )
+            plot_parity(pred_plot, true_plot, key, dict="png")
+            plot_error(pred_plot, true_plot, key, dict="png_error")
             if args.component:
                 pred_tensor = torch.cat(component_predict_value[key], dim=0)
                 true_tensor = torch.cat(component_dft_value[key], dim=0)
@@ -513,6 +525,7 @@ def main(args=None, running_as_script: bool = True):
                     key=key,
                     pred=pred_tensor,
                     true=true_tensor,
+                    exclude_indices=exclude_indices_map.get(key, tuple()),
                 ):
                     plot_parity(
                         pred_component,
@@ -538,7 +551,68 @@ def build_component_metrics_components(components):
     return component_components
 
 
-def flatten_component_metrics(metrics: Metrics, type_names=None):
+def build_exclude_indices_map(components):
+    exclude_map = {}
+    for component in components:
+        key, _, params = Metrics.parse(component)
+        exclude_indices = normalize_exclude_indices(params.get("exclude_indices", []))
+        if len(exclude_indices) == 0:
+            continue
+        existing = list(exclude_map.get(key, tuple()))
+        for index in exclude_indices:
+            if index not in existing:
+                existing.append(index)
+        exclude_map[key] = tuple(existing)
+    return exclude_map
+
+
+def normalize_exclude_indices(exclude_indices):
+    if exclude_indices is None:
+        return tuple()
+    if isinstance(exclude_indices, (list, tuple)) and len(exclude_indices) == 0:
+        return tuple()
+    if isinstance(exclude_indices, (list, tuple)) and len(exclude_indices) > 0:
+        if all(isinstance(idx, int) for idx in exclude_indices):
+            return (tuple(exclude_indices),)
+        return tuple(tuple(int(i) for i in idx) for idx in exclude_indices)
+    raise TypeError("exclude_indices must be a list of indices")
+
+
+def component_keep_mask(shape, exclude_indices=()):
+    exclude_indices = normalize_exclude_indices(exclude_indices)
+    if len(shape) == 0 or math.prod(shape) <= 1:
+        return [True]
+    index_order = list(itertools.product(*(range(dim) for dim in shape)))
+    exclude_set = set(exclude_indices)
+    keep_mask = [index not in exclude_set for index in index_order]
+    if not any(keep_mask):
+        raise ValueError(f"exclude_indices removes all components for shape {shape}")
+    return keep_mask
+
+
+def filtered_component_labels(shape, exclude_indices=()):
+    labels = component_labels(shape)
+    keep_mask = component_keep_mask(shape, exclude_indices)
+    return [label for label, keep in zip(labels, keep_mask) if keep]
+
+
+def select_plot_series(pred: torch.Tensor, true: torch.Tensor, shape, exclude_indices=()):
+    if len(normalize_exclude_indices(exclude_indices)) == 0:
+        return pred, true
+    if len(shape) == 0 or math.prod(shape) <= 1:
+        return pred, true
+    component_count = math.prod(shape)
+    pred_flat = pred.reshape(-1, component_count)
+    true_flat = true.reshape(-1, component_count)
+    keep_mask = torch.tensor(
+        component_keep_mask(shape, exclude_indices),
+        dtype=torch.bool,
+        device=pred.device,
+    )
+    return pred_flat[:, keep_mask].reshape(-1), true_flat[:, keep_mask].reshape(-1)
+
+
+def flatten_component_metrics(metrics: Metrics, type_names=None, key_shapes=None, exclude_indices_map=None):
     flat_dict = {}
     current = metrics.current_result()
     for (key, param_hash), value in current.items():
@@ -554,7 +628,11 @@ def flatten_component_metrics(metrics: Metrics, type_names=None):
             short_name = func.get_name(short_name)
         suffix = "/N" if params["PerAtom"] else ""
         item_name = f"{short_name}{suffix}_{reduction}"
-        labels = component_labels(shape)
+        source_shape = shape
+        if key_shapes is not None and key in key_shapes:
+            source_shape = key_shapes[key]
+        exclude_indices = () if exclude_indices_map is None else exclude_indices_map.get(key, tuple())
+        labels = filtered_component_labels(source_shape, exclude_indices)
 
         if params["PerSpecies"]:
             species_names = type_names
@@ -570,16 +648,18 @@ def flatten_component_metrics(metrics: Metrics, type_names=None):
     return flat_dict
 
 
-def iter_component_series(key: str, pred: torch.Tensor, true: torch.Tensor):
+def iter_component_series(key: str, pred: torch.Tensor, true: torch.Tensor, exclude_indices=()):
     shape = tuple(pred.shape[1:])
     if len(shape) == 0 or math.prod(shape) <= 1:
         return []
-    labels = component_labels(shape)
+    labels = filtered_component_labels(shape, exclude_indices)
     pred_flat = pred.reshape(pred.shape[0], -1)
     true_flat = true.reshape(true.shape[0], -1)
+    keep_mask = component_keep_mask(shape, exclude_indices)
     return [
         (f"{key}_{label}", pred_flat[:, idx].reshape(-1), true_flat[:, idx].reshape(-1))
-        for idx, label in enumerate(labels)
+        for idx, (label, keep) in enumerate(zip(component_labels(shape), keep_mask))
+        if keep
     ]
 
 

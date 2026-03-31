@@ -12,6 +12,9 @@ from torch_runstats import RunningStats, Reduction
 from ._loss import find_loss_function
 from ._key import ABBREV
 
+
+RUNNING_STATS_PARAM_KEYS = {"dim", "reduce_dims", "report_per_component"}
+
 metrics_to_reduction = {
     "mae": Reduction.MEAN,
     "mean": Reduction.MEAN,
@@ -88,6 +91,11 @@ class Metrics:
             kwargs.pop("functional", "L1Loss")
             kwargs.pop("PerSpecies")
             kwargs.pop("PerAtom")
+            func_params = {
+                key: kwargs.pop(key)
+                for key in list(kwargs.keys())
+                if key not in RUNNING_STATS_PARAM_KEYS
+            }
 
             # by default, report a scalar that is mae and rmse over all component
             self.kwargs[key][param_hash] = dict(
@@ -95,7 +103,7 @@ class Metrics:
             )
             self.kwargs[key][param_hash].update(kwargs)
             self.params[key][param_hash] = (reduction, params)
-            self.funcs[key][param_hash] = find_loss_function(functional, {})
+            self.funcs[key][param_hash] = find_loss_function(functional, func_params)
 
     def init_runstat(self, params, error: torch.Tensor):
         """
