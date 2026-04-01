@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 import ase.io
 
 import torch
+from sklearn.metrics import r2_score
 
 from nequip.data import AtomicData, Collater, dataset_from_config, register_fields
 from nequip.scripts.deploy import load_deployed_model, R_MAX_KEY
@@ -493,6 +494,21 @@ def main(args=None, running_as_script: bool = True):
             )
         )
 
+        r2_results = compute_r2_results(
+            predict_value=predict_value,
+            dft_value=dft_value,
+            output_shapes=output_shapes,
+            exclude_indices_map=exclude_indices_map,
+        )
+        if len(r2_results) > 0:
+            logger.info("\n--- R2 result: ---")
+            logger.critical(
+                "\n".join(
+                    f"{k:>20s} = {v:< 20f}"
+                    for k, v in r2_results.items()
+                )
+            )
+
         if args.component:
             component_results = flatten_component_metrics(
                 metrics=component_metrics,
@@ -506,6 +522,20 @@ def main(args=None, running_as_script: bool = True):
                     "\n".join(
                         f"{k:>20s} = {v:< 20f}"
                         for k, v in component_results.items()
+                    )
+                )
+
+            component_r2_results = compute_component_r2_results(
+                component_predict_value=component_predict_value,
+                component_dft_value=component_dft_value,
+                exclude_indices_map=exclude_indices_map,
+            )
+            if len(component_r2_results) > 0:
+                logger.info("\n--- Component-wise R2 result: ---")
+                logger.critical(
+                    "\n".join(
+                        f"{k:>20s} = {v:< 20f}"
+                        for k, v in component_r2_results.items()
                     )
                 )
 
@@ -549,6 +579,42 @@ def build_component_metrics_components(components):
         params["report_per_component"] = True
         component_components.append((key, reduction, params))
     return component_components
+
+
+def compute_r2_results(predict_value, dft_value, output_shapes, exclude_indices_map):
+    results = {}
+    for key in predict_value:
+        pred_plot, true_plot = select_plot_series(
+            pred=predict_value[key],
+            true=dft_value[key],
+            shape=output_shapes.get(key, tuple()),
+            exclude_indices=exclude_indices_map.get(key, tuple()),
+        )
+        pred_numpy = pred_plot.detach().cpu().numpy().reshape(-1)
+        true_numpy = true_plot.detach().cpu().numpy().reshape(-1)
+        if len(pred_numpy) < 2:
+            continue
+        results[f"{key}_r2"] = float(r2_score(true_numpy, pred_numpy))
+    return results
+
+
+def compute_component_r2_results(component_predict_value, component_dft_value, exclude_indices_map):
+    results = {}
+    for key in component_predict_value:
+        pred_tensor = torch.cat(component_predict_value[key], dim=0)
+        true_tensor = torch.cat(component_dft_value[key], dim=0)
+        for component_name, pred_component, true_component in iter_component_series(
+            key=key,
+            pred=pred_tensor,
+            true=true_tensor,
+            exclude_indices=exclude_indices_map.get(key, tuple()),
+        ):
+            pred_numpy = pred_component.detach().cpu().numpy().reshape(-1)
+            true_numpy = true_component.detach().cpu().numpy().reshape(-1)
+            if len(pred_numpy) < 2:
+                continue
+            results[f"{component_name}_r2"] = float(r2_score(true_numpy, pred_numpy))
+    return results
 
 
 def build_exclude_indices_map(components):
@@ -682,7 +748,6 @@ def component_labels(shape):
 def plot_parity(pred, true, key, dict="png"):
     import matplotlib.pyplot as plt
     import os
-    from sklearn.metrics import r2_score
 
     r2 = r2_score(true, pred)
     os.system("mkdir " + dict)
