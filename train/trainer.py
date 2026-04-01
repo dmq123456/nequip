@@ -211,7 +211,7 @@ class Trainer:
     """
 
     stop_keys = ["max_epochs", "early_stopping", "early_stopping_kwargs"]
-    object_keys = ["lr_sched", "optim", "ema", "early_stopping_conds"]
+    object_keys = ["lr_sched", "optim", "ema", "early_stopping_conds", "loss"]
     lr_scheduler_module = torch.optim.lr_scheduler
     optim_module = torch.optim
 
@@ -343,6 +343,7 @@ class Trainer:
             ),
             all_args=self.kwargs,
         )
+        self.loss.to(self.torch_device)
         self.loss_stat = LossStat(self.loss)
 
         # what do we train on?
@@ -389,11 +390,13 @@ class Trainer:
         opt_opt_args = dict(lr=self.learning_rate)
         if self.optimizer_kwargs is not None:
             opt_opt_args.update(self.optimizer_kwargs)
+        optim_params = list(self.model.parameters())
+        optim_params.extend(list(self.loss.parameters()))
         self.optim, self.optimizer_kwargs = instantiate_from_cls_name(
             module=[torch.optim, nequip.utils.optim],
             class_name=self.optimizer_name,
             prefix="optimizer",
-            positional_args=dict(params=self.model.parameters()),
+            positional_args=dict(params=optim_params),
             optional_args=opt_opt_args,
             all_args=self.kwargs,
         )
@@ -1296,6 +1299,13 @@ class Trainer:
         else:
             self.logger.info("\n\n  Initialization     " + log_header[VALIDATION])
             self.logger.info("! Initial Validation " + log_str[VALIDATION])
+
+        awl_coeffs = self.loss.awl_coeffs()
+        if awl_coeffs:
+            coeff_str = " ".join(
+                f"{key}={value:.6g}" for key, value in awl_coeffs.items()
+            )
+            self.logger.info(f"! AWL        {coeff_str}")
 
         wall = perf_counter() - self.wall
         self.logger.info(f"Wall time: {wall}")

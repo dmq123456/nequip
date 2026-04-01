@@ -51,6 +51,7 @@ class Loss:
         self.coeffs = {}
         self.funcs = {}
         self.keys = []
+        self.awl = None
 
         mseloss = find_loss_function("MSELoss", {})
         if isinstance(coeffs, str):
@@ -133,6 +134,37 @@ class Loss:
         if self.lauto_loss:
             loss, _ = self.awl(loss_list)
         return loss, contrib
+
+    def parameters(self):
+        if self.awl is None:
+            return []
+        return self.awl.parameters()
+
+    def to(self, device):
+        if self.awl is not None:
+            self.awl = self.awl.to(device=device)
+        return self
+
+    def awl_coeffs(self):
+        if self.awl is None:
+            return {}
+        coeffs = self.awl.coefficients()
+        return {
+            f"awl_coeff_{key}": coeffs[index].item()
+            for index, key in enumerate(self.keys)
+        }
+
+    def state_dict(self):
+        if self.awl is None:
+            return {}
+        return {"awl": self.awl.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        if self.awl is None or not state_dict:
+            return
+        awl_state = state_dict.get("awl")
+        if awl_state is not None:
+            self.awl.load_state_dict(awl_state)
 
 
 class LossStat:
@@ -234,5 +266,8 @@ class AutomaticWeightedLoss(torch.nn.Module):
             loss_sum += 0.5 / (self.params[i] ** 2) * loss + torch.log(
                 1 + self.params[i] ** 2
             )
-        coefficient = 0.5 / (self.params[: len(x)] ** 2)
+        coefficient = self.coefficients()[: len(x)]
         return loss_sum, coefficient
+
+    def coefficients(self):
+        return 0.5 / (self.params.detach() ** 2)
