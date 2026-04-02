@@ -748,39 +748,41 @@ def component_labels(shape):
 def plot_parity(pred, true, key, dict="png"):
     import matplotlib.pyplot as plt
     import os
+    import scienceplots
 
     r2 = r2_score(true, pred)
     os.system("mkdir " + dict)
-    # plot parity
-    fig, ax = plt.subplots()
     min_value = torch.min(true.min(), pred.min())
     max_value = torch.max(true.max(), pred.max())
-    ax.plot(
-        [min_value, max_value],
-        [min_value, max_value],
-        # transform=ax.transAxes,
-        ls="--",
-        c="red",
-    )
-    ax.scatter(true, pred, s=1)
 
-    ax.set_xlabel("True")
-    ax.set_ylabel("Predicted")
-    ax.set_aspect("equal")
-    ax.set_xlim(min_value, max_value)
-    ax.set_ylim(min_value, max_value)
-    ax.set_title(key)
-    
-    # Display R2 value in the top-left corner
-    r2_text = "R2: {:5f}".format(r2)
-    ax.text(
-        min_value + 0.05 * (max_value - min_value),
-        max_value - 0.05 * (max_value - min_value),
-        r2_text,
-    )
-    
-    plt.savefig(dict + "/" + key + "r2:{:5f}".format(r2) + ".png", dpi=500)
-    plt.close()
+    with plt.style.context(["science", "no-latex", "bright"]):
+        fig, ax = plt.subplots()
+        ax.plot(
+            [min_value, max_value],
+            [min_value, max_value],
+            # transform=ax.transAxes,
+            ls="--",
+            c="red",
+        )
+        ax.scatter(true, pred, s=1)
+
+        ax.set_xlabel("True")
+        ax.set_ylabel("Predicted")
+        ax.set_aspect("equal")
+        ax.set_xlim(min_value, max_value)
+        ax.set_ylim(min_value, max_value)
+        ax.set_title(key)
+
+        # Display R2 value in the top-left corner
+        r2_text = "R2: {:5f}".format(r2)
+        ax.text(
+            min_value + 0.05 * (max_value - min_value),
+            max_value - 0.05 * (max_value - min_value),
+            r2_text,
+        )
+
+        plt.savefig(dict + "/" + key + "r2:{:5f}".format(r2) + ".png", dpi=500)
+        plt.close()
 
 
 # error plots on true vs. error
@@ -789,25 +791,24 @@ def plot_error(pred, true, key, dict="png_error"):
     import os
     import scienceplots
 
-    plt.style.use(["science", "no-latex", "bright"])
-
     os.system("mkdir " + dict)
     error = pred - true
 
-    fig, (ax1, ax2) = plt.subplots(
-        1, 2, figsize=(10, 5), gridspec_kw={"width_ratios": [3, 1]}
-    )
+    with plt.style.context(["science", "no-latex", "bright"]):
+        fig, (ax1, ax2) = plt.subplots(
+            1, 2, figsize=(10, 5), gridspec_kw={"width_ratios": [3, 1]}
+        )
 
-    ax1.scatter(true, error, s=25, alpha=0.5)
-    ax1.set_xlabel(key + " DFT Values")
-    ax1.set_ylabel("Errors")
+        ax1.scatter(true, error, s=25, alpha=0.5)
+        ax1.set_xlabel(key + " DFT Values")
+        ax1.set_ylabel("Errors")
 
-    # Plot error value histogram on right subplot
-    ax2.hist(error, bins=20, orientation="horizontal")
-    ax2.set_xlabel("Count")
-    ax2.set_xscale("log")
-    plt.savefig(dict + "/" + key + ".png", dpi=500)
-    plt.close()
+        # Plot error value histogram on right subplot
+        ax2.hist(error, bins=20, orientation="horizontal")
+        ax2.set_xlabel("Count")
+        ax2.set_xscale("log")
+        plt.savefig(dict + "/" + key + ".png", dpi=500)
+        plt.close()
 
 
 if __name__ == "__main__":
