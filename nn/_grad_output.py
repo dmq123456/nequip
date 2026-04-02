@@ -655,7 +655,7 @@ class ParaStressBECOutput(GraphModuleMixin, torch.nn.Module):
                 [data[AtomicDataDict.TOTAL_DIPOLE_KEY][:, i].sum()],
                 [pos],
                 retain_graph=True,
-                create_graph=True,
+                create_graph=self.training,
             )[0]
             if bec_grads is None:
                 # condition needed to unwrap optional for torchscript
