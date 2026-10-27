@@ -749,9 +749,17 @@ def plot_parity(pred, true, key, dict="png"):
     import matplotlib.pyplot as plt
     import os
     import scienceplots
+    import numpy as np
 
     r2 = r2_score(true, pred)
     os.system("mkdir " + dict)
+    # save the raw arrays behind each parity plot
+    os.makedirs("parity_data", exist_ok=True)
+    np.savez(
+        os.path.join("parity_data", key + ".npz"),
+        pred=pred.detach().cpu().numpy(),
+        true=true.detach().cpu().numpy(),
+    )
     min_value = torch.min(true.min(), pred.min())
     max_value = torch.max(true.max(), pred.max())
 
